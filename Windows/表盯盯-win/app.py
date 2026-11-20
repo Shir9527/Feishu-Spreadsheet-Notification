@@ -922,7 +922,7 @@ async function loadHeader(i){
   }catch(e){r._err="读表头出错："+(e&&e.message||e);paint()}
 }
 function clean(){const c=JSON.parse(JSON.stringify({notify:CFG.notify,rules:CFG.rules,interval_min:CFG.interval_min||5}));c.rules.forEach(r=>{delete r._cols;delete r._sheets;delete r._rows});return c}
-async function saveAll(){const d=await post("/api/save",{config:clean()});st(d.ok?"已保存":d.error,!d.ok);return d.ok}
+async function saveAll(){const d=await post("/api/save",{config:clean()});st(d.ok?(d.msg||"已保存"):d.error,!d.ok);showStatus();return d.ok}
 async function testNotify(){const d=await post("/api/test",{config:clean()});st(d.ok?(d.msg||"已发送"):d.error,!d.ok)}
 async function initAll(){const d=await post("/api/init",{});st(d.ok?"基线已建立："+(d.detail||[]).map(x=>x.name+" "+x.rows+" 条").join("，"):d.error,!d.ok)}
 async function showStatus(){
@@ -940,6 +940,7 @@ async function setIv(v){
   CFG.interval_min=parseInt(v,10)||5;
   const d=await post("/api/interval",{min:CFG.interval_min});
   st(d.ok?(d.msg||"已设置"):d.error,!d.ok);
+  await showStatus();
 }
 async function installJob(){await saveAll();const d=await post("/api/install",{});st(d.ok?d.msg:d.error,!d.ok)}
 async function uninstallJob(){const d=await post("/api/uninstall",{});st(d.ok?d.msg:d.error,!d.ok)}

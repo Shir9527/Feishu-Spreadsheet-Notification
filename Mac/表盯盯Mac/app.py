@@ -68,9 +68,14 @@ def cli_path():
     if w:
         cands.append(w)
     home = Path.home()
-    for d in ["/opt/homebrew/bin", "/usr/local/bin", "/usr/bin",
-              str(home / ".npm-global/bin"), str(home / ".local/bin")]:
-        cands.append(str(Path(d) / "lark-cli"))
+    dirs = ["/opt/homebrew/bin", "/usr/local/bin", "/usr/bin",
+            str(home / ".npm-global/bin"), str(home / ".local/bin")]
+    appdata = os.environ.get("APPDATA") or ""
+    if appdata:
+        dirs.append(str(Path(appdata) / "npm"))
+    for d in dirs:
+        for name in ("lark-cli", "lark-cli.cmd", "lark-cli.exe", "lark-cli.bat"):
+            cands.append(str(Path(d) / name))
     for pat in ("nvm/versions/node/*/bin/lark-cli", ".volta/bin/lark-cli", ".npm-global/bin/lark-cli"):
         try:
             cands += [str(x) for x in Path(home).glob(pat)]
@@ -97,7 +102,10 @@ def cli(args):
     exe = cli_path()
     if exe == "lark-cli" and not shutil.which("lark-cli"):
         raise RuntimeError("本机找不到 lark-cli。双击「表盯盯.command」会自动安装。")
-    p = subprocess.run([exe] + args, capture_output=True, text=True)
+    cmdline = [exe] + args
+    if IS_WIN and exe.lower().endswith((".cmd", ".bat")):
+        cmdline = [os.environ.get("COMSPEC", "cmd.exe"), "/c"] + cmdline
+    p = subprocess.run(cmdline, capture_output=True, text=True)
     if p.returncode != 0:
         raise RuntimeError(f"lark-cli 调用失败：{(p.stderr or p.stdout).strip()[:300]}")
     try:
@@ -529,6 +537,8 @@ def run(dry=False):
 # ---------------- 本地配置台 ----------------
 PLIST = Path.home() / "Library" / "LaunchAgents" / "com.tablewatch.plist"
 PORT = 8799
+IS_WIN = sys.platform.startswith("win")
+TASK_NAME = "TableWatch"
 try:
     APP_VERSION = hashlib.md5(Path(__file__).read_bytes()).hexdigest()[:8]
 except Exception:
@@ -564,12 +574,33 @@ def interval_min(cfg=None):
     return v if v in INTERVALS else 5
 
 
+def task_installed():
+    """后台任务是否已注册：Mac 看 plist，Windows 看计划任务。"""
+    if IS_WIN:
+        r = subprocess.run(["schtasks", "/query", "/tn", TASK_NAME], capture_output=True, text=True)
+        return r.returncode == 0
+    return PLIST.exists()
+
+
 def install_job():
     ensure_dir()
     mins = interval_min()
     cli_exe = cli_path()
     cli_dir = str(Path(cli_exe).parent) if cli_exe and cli_exe != "lark-cli" else "/usr/local/bin"
     (DIR / "app.py").write_text(Path(__file__).read_text(encoding="utf-8"), encoding="utf-8")
+
+    if IS_WIN:
+        pyw = Path(sys.executable).with_name("pythonw.exe")
+        exe = str(pyw if pyw.exists() else Path(sys.executable))
+        tr = f'"{exe}" "{DIR / "app.py"}" run'
+        cmd = ["schtasks", "/create", "/tn", TASK_NAME, "/tr", tr,
+               "/sc", "minute", "/mo", str(mins), "/f"]
+        r = subprocess.run(cmd, capture_output=True, text=True)
+        if r.returncode != 0:
+            raise RuntimeError((r.stderr or r.stdout).strip()[:300] or "schtasks 注册失败")
+        subprocess.run(["schtasks", "/run", "/tn", TASK_NAME], capture_output=True)
+        return f"已注册 Windows 计划任务：每 {mins} 分钟检查一次"
+
     plist = f"""<?xml version="1.0" encoding="UTF-8"?>
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
 <plist version="1.0"><dict>
@@ -734,7 +765,7 @@ class H(BaseHTTPRequestHandler):
                     t = v.get("updated_at") or ""
                     if t > last:
                         last = t
-                return self._send({"ok": True, "installed": PLIST.exists(),
+                return self._send({"ok": True, "installed": task_installed(),
                                    "interval": interval_min(), "last_check": last.replace("T", " "),
                                    "log": text or "（还没有检查记录）"})
 
@@ -753,7 +784,7 @@ class H(BaseHTTPRequestHandler):
                     return self._send({"ok": False, "error": "间隔只能是 1/2/5/10/30/60 分钟"}, 400)
                 cfg["interval_min"] = v
                 save_json(CONFIG, cfg)
-                if PLIST.exists():
+                if task_installed():
                     try:
                         return self._send({"ok": True, "msg": install_job()})
                     except Exception as e:
@@ -761,7 +792,9 @@ class H(BaseHTTPRequestHandler):
                 return self._send({"ok": True, "msg": f"已设为每 {v} 分钟（启用后台检查后生效）"})
 
             if self.path == "/api/uninstall":
-                if PLIST.exists():
+                if IS_WIN:
+                    subprocess.run(["schtasks", "/delete", "/tn", TASK_NAME, "/f"], capture_output=True)
+                elif PLIST.exists():
                     subprocess.run(["launchctl", "unload", str(PLIST)], capture_output=True)
                     PLIST.unlink()
                 return self._send({"ok": True, "msg": "已停止后台检查"})
@@ -889,7 +922,7 @@ async function loadHeader(i){
   }catch(e){r._err="读表头出错："+(e&&e.message||e);paint()}
 }
 function clean(){const c=JSON.parse(JSON.stringify({notify:CFG.notify,rules:CFG.rules,interval_min:CFG.interval_min||5}));c.rules.forEach(r=>{delete r._cols;delete r._sheets;delete r._rows});return c}
-async function saveAll(){const d=await post("/api/save",{config:clean()});st(d.ok?"已保存":d.error,!d.ok);return d.ok}
+async function saveAll(){const d=await post("/api/save",{config:clean()});st(d.ok?(d.msg||"已保存"):d.error,!d.ok);showStatus();return d.ok}
 async function testNotify(){const d=await post("/api/test",{config:clean()});st(d.ok?(d.msg||"已发送"):d.error,!d.ok)}
 async function initAll(){const d=await post("/api/init",{});st(d.ok?"基线已建立："+(d.detail||[]).map(x=>x.name+" "+x.rows+" 条").join("，"):d.error,!d.ok)}
 async function showStatus(){
@@ -907,6 +940,7 @@ async function setIv(v){
   CFG.interval_min=parseInt(v,10)||5;
   const d=await post("/api/interval",{min:CFG.interval_min});
   st(d.ok?(d.msg||"已设置"):d.error,!d.ok);
+  await showStatus();
 }
 async function installJob(){await saveAll();const d=await post("/api/install",{});st(d.ok?d.msg:d.error,!d.ok)}
 async function uninstallJob(){const d=await post("/api/uninstall",{});st(d.ok?d.msg:d.error,!d.ok)}
@@ -952,13 +986,21 @@ def _probe():
 def _kill_port_holder():
     """只处理占着 8799 的那个进程，绝不会误杀自己。"""
     try:
-        out = subprocess.run(["lsof", "-ti", f"tcp:{PORT}"], capture_output=True, text=True).stdout
-        for pid in [int(x) for x in out.split() if x.isdigit()]:
-            if pid != os.getpid():
-                try:
-                    os.kill(pid, 15)
-                except Exception:
-                    pass
+        if IS_WIN:
+            out = subprocess.run(["netstat", "-ano"], capture_output=True, text=True).stdout
+            for line in out.splitlines():
+                if f":{PORT}" in line and "LISTENING" in line.upper():
+                    pid = line.split()[-1]
+                    if pid.isdigit() and int(pid) != os.getpid():
+                        subprocess.run(["taskkill", "/PID", pid, "/F"], capture_output=True)
+        else:
+            out = subprocess.run(["lsof", "-ti", f"tcp:{PORT}"], capture_output=True, text=True).stdout
+            for pid in [int(x) for x in out.split() if x.isdigit()]:
+                if pid != os.getpid():
+                    try:
+                        os.kill(pid, 15)
+                    except Exception:
+                        pass
     except Exception:
         pass
 
@@ -1010,6 +1052,14 @@ def serve():
 
 if __name__ == "__main__":
     if len(sys.argv) > 1 and sys.argv[1] == "run":
+        if IS_WIN:
+            ensure_dir()
+            try:
+                f = open(DIR / "run.log", "a", encoding="utf-8", buffering=1)
+                sys.stdout = f
+                sys.stderr = f
+            except Exception:
+                pass
         sys.exit(run("--dry" in sys.argv))
     elif len(sys.argv) > 1 and sys.argv[1] == "init":
         init()
